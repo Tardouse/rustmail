@@ -11,7 +11,7 @@ use lettre::{
     },
     SmtpTransport, Transport,
 };
-use native_tls;
+use native_tls::TlsConnector;
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
@@ -277,12 +277,13 @@ fn build_mailer(args: &Args) -> Result<SmtpTransport> {
     relay_builder = relay_builder.port(args.smtp_port).credentials(creds);
 
     if args.insecure {
-        let tls_connector = native_tls::TlsConnector::builder()
+        let tls_connector = TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
 
-        let tls_parameters = TlsParameters::new(args.smtp_server.clone())?
-            .connector(tls_connector)?;
+        let tls_parameters = TlsParameters::builder(args.smtp_server.clone())
+            .connector(tls_connector)
+            .build()?;
 
         relay_builder = relay_builder.tls(Tls::Required(tls_parameters));
     }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lettre = "0.11"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 mime_guess = "2.0"
 anyhow = "1.0"
@@ -12,6 +12,5 @@ rust-i18n = "2.2.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 dirs = "5.0"
-native-tls = "0.2.11"
 magic-crypt = "4.0.1"
 rpassword = "7.4.0"

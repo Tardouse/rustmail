@@ -44,6 +44,7 @@ struct ConfigFile {
     to: Option<Vec<String>>,
     cc: Option<Vec<String>>,
     bcc: Option<Vec<String>>,
+    smtps: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,7 +181,7 @@ fn handle_send(cli_matches: &clap::ArgMatches) -> Result<()> {
 }
 
 /// Loads configuration from the YAML file if it exists.
-fn load_config() -> Result<ConfigFile> {
+fn load_config(key: Option<String>) -> Result<ConfigFile> {
     let config_path = dirs::config_dir()
         .context("Could not find config directory")?
         .join("rustmail/mail.yaml");
@@ -193,8 +194,13 @@ fn load_config() -> Result<ConfigFile> {
         .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
 
     if content.starts_with(ENCRYPTION_HEADER) {
-        println!("{}", t!("config_encrypted_prompt"));
-        let password = rpassword::prompt_password("Password: ")?;
+        let password = match key {
+            Some(k) => k,
+            None => {
+                println!("{}", t!("config_encrypted_prompt"));
+                rpassword::prompt_password("Password: ")?
+            }
+        };
         let encrypted_b64 = content.strip_prefix(ENCRYPTION_HEADER).unwrap();
         let crypter = new_magic_crypt!(&password, 256);
         content = crypter
@@ -210,7 +216,8 @@ fn load_config() -> Result<ConfigFile> {
 
 /// Parses CLI arguments, loads config file, and merges them.
 fn parse_and_merge_args(cli_matches: &clap::ArgMatches) -> Result<Args> {
-    let config = load_config()?;
+    let key = cli_matches.get_one::<String>("key").cloned();
+    let config = load_config(key)?;
 
     // Merge and validate required fields
     let smtp_server = cli_matches
@@ -281,7 +288,7 @@ fn parse_and_merge_args(cli_matches: &clap::ArgMatches) -> Result<Args> {
             .unwrap_or_default()
             .cloned()
             .collect(),
-        smtps: cli_matches.get_flag("smtps"),
+        smtps: cli_matches.get_flag("smtps") || config.smtps.unwrap_or(false),
     };
 
     if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
@@ -325,6 +332,11 @@ fn build_cli() -> Command {
                         .long("smtp-password")
                         .env("SMTP_PASSWORD")
                         .help(t!("smtp_password_help")),
+                )
+                .arg(
+                    Arg::new("key")
+                        .long("key")
+                        .help(t!("key_help")),
                 )
                 .arg(
                     Arg::new("from_name")

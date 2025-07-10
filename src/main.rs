@@ -5,13 +5,9 @@ use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, Command};
 use lettre::{
     message::{header::ContentType, Mailbox, Message, MultiPart, SinglePart},
-    transport::smtp::{
-        authentication::Credentials,
-        client::{Tls, TlsParameters},
-    },
+    transport::smtp::authentication::Credentials,
     SmtpTransport, Transport,
 };
-use native_tls;
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
@@ -32,7 +28,6 @@ struct Args {
     body_html: Option<String>,
     attachment: Vec<PathBuf>,
     smtps: bool,
-    insecure: bool,
 }
 
 /// Represents the structure of the YAML config file. All fields are optional.
@@ -160,7 +155,6 @@ fn parse_and_merge_args() -> Result<Args> {
             .cloned()
             .collect(),
         smtps: cli_matches.get_flag("smtps"),
-        insecure: cli_matches.get_flag("insecure"),
     };
 
     if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
@@ -256,71 +250,56 @@ fn build_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .help(t!("smtps_help")),
         )
-        .arg(
-            Arg::new("insecure")
-                .long("insecure")
-                .action(ArgAction::SetTrue)
-                .help(t!("insecure_help")),
-        )
 }
 
 /// Configures and builds the SMTP transport (mailer).
 fn build_mailer(args: &Args) -> Result<SmtpTransport> {
     let creds = Credentials::new(args.smtp_username.clone(), args.smtp_password.clone());
 
-    let mut relay_builder = if args.smtps {
+    let relay_builder = if args.smtps {
         SmtpTransport::relay(&args.smtp_server)?
     } else {
         SmtpTransport::starttls_relay(&args.smtp_server)?
     };
 
-    relay_builder = relay_builder.port(args.smtp_port).credentials(creds);
+    let mailer = relay_builder
+        .port(args.smtp_port)
+        .credentials(creds)
+        .build();
 
-    if args.insecure {
-        let tls_connector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-
-        let tls_parameters = TlsParameters::new(args.smtp_server.clone())?
-            .connector(tls_connector)?;
-
-        relay_builder = relay_builder.tls(Tls::Required(tls_parameters));
-    }
-
-    Ok(relay_builder.build())
+    Ok(mailer)
 }
 
 /// Constructs the email message from arguments.
 fn build_message(args: &Args) -> Result<Message> {
-    // --- From ---
-    let from_mailbox: Mailbox = if let Some(name) = &args.from_name {
-        format!("{name} <{}>", args.smtp_username).parse()?
+    let from_mailbox = if let Some(name) = &args.from_name {
+        Mailbox::new(
+            Some(name.clone()),
+            args.smtp_username.parse().context("Invalid 'from' email address")?,
+        )
     } else {
-        args.smtp_username.parse()?
+        args.smtp_username.parse().context("Invalid 'from' email address")?
     };
 
     let mut builder = Message::builder().from(from_mailbox);
 
-    // --- To, CC, BCC ---
     for recipient in &args.to {
-        builder = builder.to(recipient.parse()?);
+        builder = builder.to(recipient.parse().context("Invalid 'to' email address")?);
     }
     for recipient in &args.cc {
-        builder = builder.cc(recipient.parse()?);
+        builder = builder.cc(recipient.parse().context("Invalid 'cc' email address")?);
     }
     for recipient in &args.bcc {
-        builder = builder.bcc(recipient.parse()?);
+        builder = builder.bcc(recipient.parse().context("Invalid 'bcc' email address")?);
     }
 
-    // --- Subject ---
     builder = builder.subject(&args.subject);
 
-    // --- Body and Attachments ---
     let body_text = read_content(&args.body).context(t!("fail_read_text"))?;
     let body_html = args
         .body_html
         .as_ref()
-        .map(|s| read_content(s)) // Use closure here
+        .map(|s| read_content(s))
         .transpose()
         .context(t!("fail_read_html"))?;
 

@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, Command};
 use lettre::{
     message::{header::ContentType, Mailbox, Message, MultiPart, SinglePart},
-    transport::smtp::authentication::Credentials,
+    transport::smtp::{
+        authentication::Credentials,
+        client::{Tls, TlsParameters},
+    },
     SmtpTransport, Transport,
 };
 use serde::Deserialize;
@@ -256,13 +259,18 @@ fn build_cli() -> Command {
 fn build_mailer(args: &Args) -> Result<SmtpTransport> {
     let creds = Credentials::new(args.smtp_username.clone(), args.smtp_password.clone());
 
-    let relay_builder = if args.smtps {
+    let mut builder = if args.smtps {
         SmtpTransport::relay(&args.smtp_server)?
     } else {
         SmtpTransport::starttls_relay(&args.smtp_server)?
     };
 
-    let mailer = relay_builder
+    if args.smtps {
+        let tls = TlsParameters::new(args.smtp_server.clone())?;
+        builder = builder.tls(Tls::Wrapper(tls));
+    }
+
+    let mailer = builder
         .port(args.smtp_port)
         .credentials(creds)
         .build();

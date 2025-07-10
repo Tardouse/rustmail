@@ -53,7 +53,7 @@ cc:
 
 ## Usage
 
-You can see all available options by running `rustmail --help`.
+You can see all available options by running `rustmail send --help`.
 
 ### Example 1: From a Shell Script
 
@@ -82,7 +82,7 @@ fi
 
 # Send the email notification with the log file as an attachment
 # Assumes SMTP credentials are in the config file or env vars
-rustmail \
+rustmail send \
   --to "$RECIPIENT" \
   --subject "$SUBJECT" \
   --body "$BODY" \
@@ -123,7 +123,7 @@ def send_notification(success, report_content):
     
     # rustmail will use credentials from its config file or environment variables
     command = [
-        "rustmail",
+        "rustmail", "send",
         "--to", "team@example.com",
         "--subject", subject,
         "--body", report_content,

@@ -13,3 +13,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 dirs = "5.0"
 native-tls = "0.2.11"
+magic-crypt = "4.0.1"
+rpassword = "7.4.0"

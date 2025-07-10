@@ -2,16 +2,19 @@
 extern crate rust_i18n;
 
 use anyhow::{Context, Result};
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, Subcommand};
 use lettre::{
-    message::{header::ContentType, Mailbox, Message, MultiPart, SinglePart},
-    transport::smtp::authentication::Credentials,
     SmtpTransport, Transport,
+    message::{Mailbox, Message, MultiPart, SinglePart, header::ContentType},
+    transport::smtp::authentication::Credentials,
 };
+use magic_crypt::{MagicCryptTrait, new_magic_crypt};
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
 i18n!("locales", fallback = "en");
+
+const ENCRYPTION_HEADER: &str = "RUSTMAIL_ENCRYPTED_V1\n";
 
 /// Represents the final, validated arguments for the application.
 struct Args {
@@ -43,9 +46,127 @@ struct ConfigFile {
     bcc: Option<Vec<String>>,
 }
 
-fn main() -> Result<()> {
-    let args = parse_and_merge_args()?;
+#[derive(Subcommand, Debug)]
+enum CliSubCommand {
+    /// Encrypts a configuration file.
+    Encrypt {
+        /// The configuration file to encrypt.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Decrypts a configuration file.
+    Decrypt {
+        /// The configuration file to decrypt.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Sends an email with the given options.
+    Send {
+        #[arg(long, env = "SMTP_SERVER", help_heading = "SMTP")]
+        smtp_server: Option<String>,
+        #[arg(long, env = "SMTP_PORT", help_heading = "SMTP")]
+        smtp_port: Option<u16>,
+        #[arg(long, env = "SMTP_USERNAME", help_heading = "SMTP")]
+        smtp_username: Option<String>,
+        #[arg(long, env = "SMTP_PASSWORD", help_heading = "SMTP")]
+        smtp_password: Option<String>,
+        #[arg(long, help_heading = "Email")]
+        from_name: Option<String>,
+        #[arg(long, action = ArgAction::Append, value_delimiter = ',', help_heading = "Email")]
+        to: Vec<String>,
+        #[arg(long, action = ArgAction::Append, value_delimiter = ',', help_heading = "Email")]
+        cc: Vec<String>,
+        #[arg(long, action = ArgAction::Append, value_delimiter = ',', help_heading = "Email")]
+        bcc: Vec<String>,
+        #[arg(long, required = true, help_heading = "Content")]
+        subject: String,
+        #[arg(long, required = true, help_heading = "Content")]
+        body: String,
+        #[arg(long, help_heading = "Content")]
+        body_html: Option<String>,
+        #[arg(long, action = ArgAction::Append, value_parser = clap::value_parser!(PathBuf), help_heading = "Content")]
+        attachment: Vec<PathBuf>,
+        #[arg(long, action = ArgAction::SetTrue, help_heading = "SMTP")]
+        smtps: bool,
+    },
+}
 
+fn main() -> Result<()> {
+    let cli = build_cli().get_matches();
+
+    match cli.subcommand() {
+        Some(("encrypt", sub_matches)) => {
+            let file = sub_matches.get_one::<PathBuf>("file").unwrap();
+            handle_encrypt(file)
+        }
+        Some(("decrypt", sub_matches)) => {
+            let file = sub_matches.get_one::<PathBuf>("file").unwrap();
+            handle_decrypt(file)
+        }
+        Some(("send", sub_matches)) => handle_send(sub_matches),
+        _ => {
+            build_cli().print_help()?;
+            Ok(())
+        }
+    }
+}
+
+fn handle_encrypt(file: &PathBuf) -> Result<()> {
+    let content = fs::read_to_string(file)
+        .with_context(|| format!("Failed to read file for encryption: {:?}", file))?;
+
+    if content.starts_with(ENCRYPTION_HEADER) {
+        println!("{}", t!("already_encrypted"));
+        return Ok(());
+    }
+
+    println!("{}", t!("enter_password_encrypt"));
+    let password = rpassword::prompt_password("Password: ")?;
+    let confirm_password = rpassword::prompt_password("Confirm Password: ")?;
+
+    if password != confirm_password {
+        return Err(anyhow::anyhow!(t!("password_mismatch")));
+    }
+
+    let crypter = new_magic_crypt!(&password, 256);
+    let encrypted_string = crypter.encrypt_str_to_base64(content);
+
+    let final_content = format!("{}{}", ENCRYPTION_HEADER, encrypted_string);
+    fs::write(file, final_content)
+        .with_context(|| format!("Failed to write encrypted file: {:?}", file))?;
+
+    println!("{}", t!("encrypt_success", file = file.to_string_lossy()));
+    Ok(())
+}
+
+fn handle_decrypt(file: &PathBuf) -> Result<()> {
+    let content = fs::read_to_string(file)
+        .with_context(|| format!("Failed to read file for decryption: {:?}", file))?;
+
+    if !content.starts_with(ENCRYPTION_HEADER) {
+        println!("{}", t!("not_encrypted"));
+        return Ok(());
+    }
+
+    let encrypted_b64 = content.strip_prefix(ENCRYPTION_HEADER).unwrap();
+
+    println!("{}", t!("enter_password_decrypt"));
+    let password = rpassword::prompt_password("Password: ")?;
+
+    let crypter = new_magic_crypt!(&password, 256);
+    let decrypted_string = crypter
+        .decrypt_base64_to_string(encrypted_b64)
+        .map_err(|e| anyhow::anyhow!(t!("decryption_failed")).context(e))?;
+
+    fs::write(file, decrypted_string)
+        .with_context(|| format!("Failed to write decrypted file: {:?}", file))?;
+
+    println!("{}", t!("decrypt_success", file = file.to_string_lossy()));
+    Ok(())
+}
+
+fn handle_send(cli_matches: &clap::ArgMatches) -> Result<()> {
+    let args = parse_and_merge_args(cli_matches)?;
     let mailer = build_mailer(&args)?;
     let email = build_message(&args)?;
 
@@ -68,8 +189,18 @@ fn load_config() -> Result<ConfigFile> {
         return Ok(ConfigFile::default());
     }
 
-    let content = fs::read_to_string(&config_path)
+    let mut content = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+
+    if content.starts_with(ENCRYPTION_HEADER) {
+        println!("{}", t!("config_encrypted_prompt"));
+        let password = rpassword::prompt_password("Password: ")?;
+        let encrypted_b64 = content.strip_prefix(ENCRYPTION_HEADER).unwrap();
+        let crypter = new_magic_crypt!(&password, 256);
+        content = crypter
+            .decrypt_base64_to_string(encrypted_b64)
+            .map_err(|e| anyhow::anyhow!(t!("decryption_failed")).context(e))?;
+    }
 
     let config: ConfigFile = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse config file at {:?}", config_path))?;
@@ -78,8 +209,7 @@ fn load_config() -> Result<ConfigFile> {
 }
 
 /// Parses CLI arguments, loads config file, and merges them.
-fn parse_and_merge_args() -> Result<Args> {
-    let cli_matches = build_cli().get_matches();
+fn parse_and_merge_args(cli_matches: &clap::ArgMatches) -> Result<Args> {
     let config = load_config()?;
 
     // Merge and validate required fields
@@ -115,19 +245,22 @@ fn parse_and_merge_args() -> Result<Args> {
 
     let to = cli_matches
         .get_many::<String>("to")
-        .map(|vals| vals.map(String::from).collect())
+        .map(|vals| vals.cloned().collect())
+        .filter(|v: &Vec<String>| !v.is_empty())
         .or(config.to)
         .unwrap_or_default();
 
     let cc = cli_matches
         .get_many::<String>("cc")
-        .map(|vals| vals.map(String::from).collect())
+        .map(|vals| vals.cloned().collect())
+        .filter(|v: &Vec<String>| !v.is_empty())
         .or(config.cc)
         .unwrap_or_default();
 
     let bcc = cli_matches
         .get_many::<String>("bcc")
-        .map(|vals| vals.map(String::from).collect())
+        .map(|vals| vals.cloned().collect())
+        .filter(|v: &Vec<String>| !v.is_empty())
         .or(config.bcc)
         .unwrap_or_default();
 
@@ -140,14 +273,8 @@ fn parse_and_merge_args() -> Result<Args> {
         to,
         cc,
         bcc,
-        subject: cli_matches
-            .get_one::<String>("subject")
-            .cloned()
-            .context("Subject is required")?,
-        body: cli_matches
-            .get_one::<String>("body")
-            .cloned()
-            .context("Body is required")?,
+        subject: cli_matches.get_one::<String>("subject").cloned().unwrap(),
+        body: cli_matches.get_one::<String>("body").cloned().unwrap(),
         body_html: cli_matches.get_one::<String>("body_html").cloned(),
         attachment: cli_matches
             .get_many::<PathBuf>("attachment")
@@ -169,86 +296,110 @@ fn build_cli() -> Command {
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(t!("app_about"))
-        .arg(
-            Arg::new("smtp_server")
-                .long("smtp-server")
-                .env("SMTP_SERVER")
-                .help(t!("smtp_server_help")),
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("send")
+                .about("Sends an email")
+                .arg(
+                    Arg::new("smtp_server")
+                        .long("smtp-server")
+                        .env("SMTP_SERVER")
+                        .help(t!("smtp_server_help")),
+                )
+                .arg(
+                    Arg::new("smtp_port")
+                        .long("smtp-port")
+                        .env("SMTP_PORT")
+                        .value_parser(clap::value_parser!(u16))
+                        .help(t!("smtp_port_help")),
+                )
+                .arg(
+                    Arg::new("smtp_username")
+                        .long("smtp-username")
+                        .env("SMTP_USERNAME")
+                        .help(t!("smtp_username_help")),
+                )
+                .arg(
+                    Arg::new("smtp_password")
+                        .long("smtp-password")
+                        .env("SMTP_PASSWORD")
+                        .help(t!("smtp_password_help")),
+                )
+                .arg(
+                    Arg::new("from_name")
+                        .long("from-name")
+                        .help(t!("from_name_help")),
+                )
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .action(ArgAction::Append)
+                        .value_delimiter(',')
+                        .help(t!("to_help")),
+                )
+                .arg(
+                    Arg::new("cc")
+                        .long("cc")
+                        .action(ArgAction::Append)
+                        .value_delimiter(',')
+                        .help(t!("cc_help")),
+                )
+                .arg(
+                    Arg::new("bcc")
+                        .long("bcc")
+                        .action(ArgAction::Append)
+                        .value_delimiter(',')
+                        .help(t!("bcc_help")),
+                )
+                .arg(
+                    Arg::new("subject")
+                        .long("subject")
+                        .required(true)
+                        .help(t!("subject_help")),
+                )
+                .arg(
+                    Arg::new("body")
+                        .long("body")
+                        .required(true)
+                        .help(t!("body_help")),
+                )
+                .arg(
+                    Arg::new("body_html")
+                        .long("body-html")
+                        .help(t!("body_html_help")),
+                )
+                .arg(
+                    Arg::new("attachment")
+                        .long("attachment")
+                        .action(ArgAction::Append)
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .help(t!("attachment_help")),
+                )
+                .arg(
+                    Arg::new("smtps")
+                        .long("smtps")
+                        .action(ArgAction::SetTrue)
+                        .help(t!("smtps_help")),
+                ),
         )
-        .arg(
-            Arg::new("smtp_port")
-                .long("smtp-port")
-                .env("SMTP_PORT")
-                .value_parser(clap::value_parser!(u16))
-                .help(t!("smtp_port_help")),
+        .subcommand(
+            Command::new("encrypt")
+                .about("Encrypts a configuration file")
+                .arg(
+                    Arg::new("file")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf)),
+                ),
         )
-        .arg(
-            Arg::new("smtp_username")
-                .long("smtp-username")
-                .env("SMTP_USERNAME")
-                .help(t!("smtp_username_help")),
-        )
-        .arg(
-            Arg::new("smtp_password")
-                .long("smtp-password")
-                .env("SMTP_PASSWORD")
-                .help(t!("smtp_password_help")),
-        )
-        .arg(
-            Arg::new("from_name")
-                .long("from-name")
-                .help(t!("from_name_help")),
-        )
-        .arg(
-            Arg::new("to")
-                .long("to")
-                .action(ArgAction::Append)
-                .value_delimiter(',')
-                .help(t!("to_help")),
-        )
-        .arg(
-            Arg::new("cc")
-                .long("cc")
-                .action(ArgAction::Append)
-                .value_delimiter(',')
-                .help(t!("cc_help")),
-        )
-        .arg(
-            Arg::new("bcc")
-                .long("bcc")
-                .action(ArgAction::Append)
-                .value_delimiter(',')
-                .help(t!("bcc_help")),
-        )
-        .arg(
-            Arg::new("subject")
-                .long("subject")
-                .required(true)
-                .help(t!("subject_help")),
-        )
-        .arg(
-            Arg::new("body")
-                .long("body")
-                .required(true)
-                .help(t!("body_help")),
-        )
-        .arg(
-            Arg::new("body_html")
-                .long("body-html")
-                .help(t!("body_html_help")),
-        )
-        .arg(
-            Arg::new("attachment")
-                .long("attachment")
-                .action(ArgAction::Append)
-                .value_parser(clap::value_parser!(PathBuf))
-                .help(t!("attachment_help")),
-        )
-        .arg(
-            Arg::new("smtps")
-                .long("smtps")
-                .action(ArgAction::SetTrue)
-                .help(t!("smtps_help")),
+        .subcommand(
+            Command::new("decrypt")
+                .about("Decrypts a configuration file")
+                .arg(
+                    Arg::new("file")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf)),
+                ),
         )
 }
 
@@ -275,10 +426,14 @@ fn build_message(args: &Args) -> Result<Message> {
     let from_mailbox = if let Some(name) = &args.from_name {
         Mailbox::new(
             Some(name.clone()),
-            args.smtp_username.parse().context("Invalid 'from' email address")?,
+            args.smtp_username
+                .parse()
+                .context("Invalid 'from' email address")?,
         )
     } else {
-        args.smtp_username.parse().context("Invalid 'from' email address")?
+        args.smtp_username
+            .parse()
+            .context("Invalid 'from' email address")?
     };
 
     let mut builder = Message::builder().from(from_mailbox);
@@ -311,8 +466,7 @@ fn build_message(args: &Args) -> Result<Message> {
 /// Reads content from a string, interpreting a leading '@' as a file path.
 fn read_content(content_or_path: &str) -> Result<String> {
     if let Some(path) = content_or_path.strip_prefix('@') {
-        fs::read_to_string(path)
-            .with_context(|| t!("fail_read_content", path = path))
+        fs::read_to_string(path).with_context(|| t!("fail_read_content", path = path))
     } else {
         Ok(content_or_path.to_string())
     }
@@ -324,51 +478,72 @@ fn build_multipart(
     html: Option<String>,
     attachments: &[PathBuf],
 ) -> Result<MultiPart> {
-    // Start with the body, creating the initial MultiPart object
-    let mut multipart = match html {
-        Some(html_content) => {
-            let body = MultiPart::alternative()
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_PLAIN)
-                        .body(text),
-                )
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_HTML)
-                        .body(html_content),
-                );
-            // The builder is consumed and returns a MultiPart
-            MultiPart::mixed().multipart(body)
-        }
-        None => {
-            let body = SinglePart::builder()
+    let multipart = if let Some(html_content) = html {
+        MultiPart::alternative()
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(text),
+            )
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_HTML)
+                    .body(html_content),
+            )
+    } else {
+        MultiPart::alternative().singlepart(
+            SinglePart::builder()
                 .header(ContentType::TEXT_PLAIN)
-                .body(text);
-            // The builder is consumed and returns a MultiPart
-            MultiPart::mixed().singlepart(body)
-        }
+                .body(text),
+        )
     };
 
-    // Now, iterate through attachments and add them to the MultiPart
+    let mut root = MultiPart::mixed().multipart(multipart);
+
     for path in attachments {
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("attachment")
             .to_string();
-        let content =
-            fs::read(path).with_context(|| t!("fail_read_attachment", path = path.to_string_lossy()))?;
+        let content = fs::read(path)
+            .with_context(|| t!("fail_read_attachment", path = path.to_string_lossy()))?;
         let content_type = mime_guess::from_path(path)
             .first_or_octet_stream()
             .to_string();
 
         let attachment = lettre::message::Attachment::new(filename)
             .body(content, ContentType::parse(&content_type)?);
-        
-        // The multipart object is consumed and replaced by a new one with the attachment
-        multipart = multipart.singlepart(attachment);
+
+        root = root.singlepart(attachment);
     }
 
-    Ok(multipart)
+    Ok(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_content_from_string() {
+        assert_eq!(read_content("Hello World").unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_read_content_from_file() {
+        // Create a dummy test file
+        fs::create_dir_all("tests").unwrap();
+        fs::write("tests/test_file.txt", "This is a test file.").unwrap();
+        let result = read_content("@tests/test_file.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "This is a test file.");
+        fs::remove_file("tests/test_file.txt").unwrap();
+    }
+
+    #[test]
+    fn test_read_content_from_nonexistent_file() {
+        let result = read_content("@nonexistent.txt");
+        assert!(result.is_err());
+    }
 }

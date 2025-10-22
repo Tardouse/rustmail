@@ -11,6 +11,9 @@ RustMail is a lightweight, versatile, and standalone command-line utility for se
 - **Internationalization (i18n):** UI messages are available in English and Chinese, automatically selected based on your system's locale.
 
 ## Installation
+Downloads from Release.
+
+Or
 
 Ensure you have Rust and Cargo installed. You can then build and install RustMail with a single command:
 
